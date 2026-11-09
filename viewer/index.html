@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Floor plan 3D viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #14161a; color: #e8eaed; font: 13px system-ui, sans-serif; }
+  #hud { position: fixed; top: 10px; left: 10px; background: #0009; padding: 10px 12px; border-radius: 8px; max-width: 340px; line-height: 1.5; }
+  #hud button { margin: 2px 2px 0 0; }
+  #warn { color: #ffb74d; margin-top: 6px; white-space: pre-wrap; }
+  #drop { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: #000a; font-size: 20px; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="hud">
+  <b>Floor plan 3D</b> <span id="meta"></span><br>
+  <button id="top">Top</button><button id="persp">Perspective</button>
+  <button id="ceil">Toggle ceiling cut</button><button id="labels">Toggle areas</button>
+  <div id="warn"></div>
+  <div style="opacity:.6;margin-top:6px">Serve this folder (python -m http.server) or drop a scene.json here.</div>
+</div>
+<div id="drop">Drop scene.json</div>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x14161a);
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.05, 500);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 0.9));
+const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+scene.add(sun);
+
+const MAT = {
+  solid:  new THREE.MeshStandardMaterial({ color: 0xe9e4da, roughness: 0.9 }),
+  exterior: new THREE.MeshStandardMaterial({ color: 0xd8d2c4, roughness: 0.9 }),
+  glass:  new THREE.MeshPhysicalMaterial({ color: 0x9fd3ff, transparent: true, opacity: 0.35, roughness: 0.05 }),
+  floor:  new THREE.MeshStandardMaterial({ color: 0x9a8a78, roughness: 1, side: THREE.DoubleSide }),
+};
+const root = new THREE.Group();
+scene.add(root);
+let labelGroup = new THREE.Group();
+
+function clear() {
+  root.traverse(o => { o.geometry?.dispose(); });
+  root.clear();
+}
+
+function build(data) {
+  clear();
+  const H = data.ceiling_height_m;
+  const walls = new THREE.Group();
+  for (const w of data.walls) {
+    const [sx, sy, sz] = w.size;
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz),
+      w.kind === "glass" ? MAT.glass : (w.wall_kind === "exterior" ? MAT.exterior : MAT.solid));
+    mesh.position.set(...w.center);
+    mesh.rotation.y = w.rotation_y;
+    mesh.castShadow = w.kind !== "glass";
+    mesh.receiveShadow = true;
+    walls.add(mesh);
+  }
+  walls.name = "walls";
+  root.add(walls);
+
+  for (const f of data.floors) {
+    const shape = new THREE.Shape(f.polygon.map(([x, z]) => new THREE.Vector2(x, -z)));
+    for (const h of f.holes) shape.holes.push(new THREE.Path(h.map(([x, z]) => new THREE.Vector2(x, -z))));
+    const geo = new THREE.ShapeGeometry(shape);
+    geo.rotateX(-Math.PI / 2);
+    const m = new THREE.Mesh(geo, MAT.floor);
+    m.position.y = 0.002;
+    m.receiveShadow = true;
+    root.add(m);
+  }
+
+  labelGroup = new THREE.Group();
+  for (const f of data.floors) {
+    const c = document.createElement("canvas"); c.width = 256; c.height = 64;
+    const g = c.getContext("2d");
+    g.fillStyle = "#000a"; g.fillRect(0, 0, 256, 64);
+    g.fillStyle = "#fff"; g.font = "32px sans-serif"; g.textAlign = "center";
+    g.fillText(f.area_m2.toFixed(1) + " m²", 128, 44);
+    const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), depthTest: false }));
+    spr.scale.set(2, 0.5, 1);
+    spr.position.set(f.centroid[0], H * 0.5, f.centroid[1]);
+    labelGroup.add(spr);
+  }
+  root.add(labelGroup);
+
+  const [minx, minz] = data.bounds.min, [maxx, maxz] = data.bounds.max;
+  const cx = (minx + maxx) / 2, cz = (minz + maxz) / 2;
+  const span = Math.max(maxx - minx, maxz - minz, 1);
+  controls.target.set(cx, 0, cz);
+  camera.position.set(cx + span * 0.6, span * 0.9, cz + span * 0.9);
+  sun.position.set(cx + span, span * 1.5, cz + span * 0.5);
+  sun.target.position.set(cx, 0, cz); scene.add(sun.target);
+  const sc = sun.shadow.camera; sc.left = sc.bottom = -span; sc.right = sc.top = span; sc.far = span * 5; sc.updateProjectionMatrix();
+
+  const grid = new THREE.GridHelper(Math.ceil(span * 2), Math.ceil(span * 2), 0x444a55, 0x2a2f38);
+  grid.position.set(cx, -0.001, cz); root.add(grid);
+
+  document.getElementById("meta").textContent =
+    `· ${data.scale.meters_per_pixel.toExponential(3)} m/px (${data.scale.source}, ${data.scale.level})`;
+  document.getElementById("warn").textContent = (data.warnings || []).slice(0, 6).join("\n");
+}
+
+async function load(src) {
+  try { build(typeof src === "string" ? await (await fetch(src)).json() : src); }
+  catch (e) { document.getElementById("warn").textContent = "Could not load scene: " + e.message; }
+}
+load(new URLSearchParams(location.search).get("scene") || "scene.json");
+
+addEventListener("dragover", e => { e.preventDefault(); drop.style.display = "flex"; });
+addEventListener("dragleave", () => drop.style.display = "none");
+addEventListener("drop", async e => {
+  e.preventDefault(); drop.style.display = "none";
+  const f = e.dataTransfer.files[0]; if (f) load(JSON.parse(await f.text()));
+});
+const drop = document.getElementById("drop");
+
+document.getElementById("top").onclick = () => { const t = controls.target; camera.position.set(t.x, 40, t.z + 0.01); };
+document.getElementById("persp").onclick = () => { const t = controls.target; camera.position.set(t.x + 8, 8, t.z + 10); };
+document.getElementById("labels").onclick = () => labelGroup.visible = !labelGroup.visible;
+let cut = false;
+document.getElementById("ceil").onclick = () => {   // clip walls to half height to see inside
+  cut = !cut; renderer.clippingPlanes = cut ? [new THREE.Plane(new THREE.Vector3(0, -1, 0), 1.2)] : [];
+};
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+</script>
+</body>
+</html>

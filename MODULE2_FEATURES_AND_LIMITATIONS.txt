@@ -1,0 +1,164 @@
+PERCEPTION MODULE (MODULE 2) - FEATURES AND LIMITATIONS
+=======================================================
+
+Package: perception (lives beside "ingestion" in src/)
+Input:   uint8 grayscale or BGR image, dark lines on a light background
+         (exactly what IngestionService produces for raster/PDF input)
+Output:  PerceptionResult - wall mask, opening mask, text mask, cleaned image,
+         doors/windows/openings, text annotations, warnings
+
+
+1. FEATURES
+-----------
+
+1.1 Pipeline (in order)
+  1. Text detection (EasyOCR, optional) and removal
+  2. Wall segmentation on the text-free image
+  3. Door/window/opening detection (YOLO model, or experimental heuristic)
+  4. Carving detected openings out of the wall mask
+
+1.2 Text handling
+  - EasyOCR adapter; the model is loaded once at construction
+  - Three modes: OFF, AUTO (use if installed, otherwise warn and continue),
+    REQUIRED (fail immediately if not installed - no silent degradation)
+  - Exact (rotated) text outlines are erased, not just bounding boxes, so
+    walls running beside rotated text are not damaged
+  - Removal by Telea inpainting (reconstructs lines crossing text) or white fill
+  - Each item is classified as DIMENSION (3500, 3.5m, 3,5 m, 12'-6", 3.5 x 4.0)
+    or LABEL (BEDROOM, Bath 2), useful later for scale recovery
+  - Low-confidence detections are ignored (default 0.4) so false positives do
+    not erase real wall pixels
+  - Optional heuristic fallback (off by default) removes isolated glyph-sized
+    specks when OCR is not installed; size limits scale with image resolution
+
+1.3 Wall segmentation
+  - Otsu thresholding (default) or adaptive thresholding for uneven lighting
+  - Solid thick walls stay solid (the original adaptive threshold with a 21 px
+    block turned them into hollow outlines)
+  - Keeps long straight strokes via oriented line openings: horizontal and
+    vertical by default, diagonal angles configurable (e.g. 45, 135)
+  - Minimum stroke length is a ratio of image size, not a fixed pixel count
+  - Gap closing and small-speck removal (area as a ratio of image area)
+  - Output is a strict binary mask (0 / 255)
+
+1.4 Door / window / opening detection
+  - YOLO (Ultralytics) adapter with:
+      * configurable confidence and device ("cpu", "cuda", "cuda:0")
+      * configurable class-name mapping to door / window / opening
+      * unmapped classes (sofa, etc.) ignored
+      * boxes clipped to the image, returned as plain Python ints
+  - Experimental model-free door-swing detector (off by default): removes
+    straight walls, fits circles to remaining arcs, accepts quarter-turn arcs
+    of plausible radius, rejects full circles (columns/fixtures) and solid blobs
+  - Detectors are pluggable: any object with detect(...) can be injected
+
+1.5 Opening carving
+  - Doors and openings are removed from the wall mask by default; windows are
+    kept as wall by default (all three switchable), with optional padding
+  - The carved regions are returned separately as opening_mask for later steps
+
+1.6 Engineering
+  - Validated, frozen PerceptionConfig; all scale-dependent thresholds are ratios
+  - Typed exceptions: InvalidImageError, DependencyError, ModelLoadError,
+    InferenceError (detector failures are wrapped, not leaked)
+  - Missing optional libraries or model files fail with clear messages
+  - Input is never modified; BGR or grayscale accepted; strict dtype/shape checks
+  - Integration helper: extract_from_ingestion(IngestionResult)
+  - Logging, type hints (mypy --strict clean), ruff clean
+  - 45 automated tests (75 total with Module 1), no model downloads needed:
+    detectors are tested through fakes and an injected fake YOLO model
+  - End-to-end demo script: examples/run_pipeline.py
+
+
+2. CHANGES FROM THE ORIGINAL CODE (BUGS FIXED)
+----------------------------------------------
+  - Hollow walls: adaptive threshold with a tiny block size hollowed out solid
+    strokes -> Otsu default, adaptive block now scales with image size
+  - Silent failure: requested OCR / YOLO quietly disabled when not installed
+    -> explicit modes, errors and warnings in the result
+  - Dangerous fallback: the connected-component "text" filter ran by default and
+    could erase tiny door arcs and hatch fragments -> now opt-in
+  - Meaningless door heuristic (area test on Canny contours, confidence 0.5)
+    -> replaced by circle-fit detector, opt-in, marked source="heuristic"
+  - Rectangular text boxes could wipe nearby wall pixels -> polygon masks
+  - NumPy integer types leaked into box tuples -> plain ints
+  - Detectors ran before walls although the door heuristic needs walls ->
+    order fixed (walls first, then symbols, then carving)
+  - Door carving silently deleted wall pixels with no record -> opening_mask
+  - Windows and the "opening" class were ignored -> handled
+  - Hard-coded pixel constants tuned for 2048 px -> ratio-based
+  - Model files and device were not validated -> validated at construction
+
+Renamed or changed fields (update callers):
+  - inpainted_image  ->  cleaned_image (now grayscale, not BGR)
+  - DetectedSymbol: "center" is a property; new "category" and "source" fields
+  - New result fields: opening_mask, text_mask, openings, image_size, warnings
+  - Constructor takes a PerceptionConfig instead of loose arguments
+
+
+3. LIMITATIONS
+--------------
+
+3.1 Wall segmentation is classical, not learned
+  - It finds long straight dark strokes. It cannot tell walls from other long
+    lines: dimension lines, grid lines, furniture edges, title-block borders
+    and hatching can all appear in the wall mask
+  - Double-line (outline) walls produce two thin lines, not a filled wall
+  - Thick diagonal strokes leak partly into the horizontal/vertical mask,
+    because their horizontal cross-section can exceed the minimum stroke length
+  - Curved walls are not retained (only straight runs)
+  - Color and layer information are gone (grayscale input)
+  - For production accuracy on varied plans, a trained segmentation model
+    (e.g. CubiCasa-style) should replace WallSegmenter; the pipeline is built
+    so that stage can be swapped
+
+3.2 Symbol detection
+  - Real accuracy depends entirely on your YOLO weights; none are included and
+    none were tested here (the adapter is tested with a fake model)
+  - The model-free door detector is experimental: it needs clean, unbroken
+    arcs, only finds quarter-turn swings, ignores sliding/folding/double-leaf
+    doors, and can miss arcs the wall step trimmed heavily or flag curved
+    furniture. Three or more arcs close together are rejected as a circle
+    fragment, so a bank of three or more doors in a row can be missed
+  - No windows are detected without a model
+  - Carving removes the whole box. If a model returns loose boxes they can
+    erase neighbouring wall; tune carve_padding_px and confidence
+
+3.3 Text
+  - OCR is untested here with real EasyOCR (fakes only); install it and verify
+  - The image is typically downscaled to 2048 px by Module 1, so small text on
+    large sheets may be too tiny to detect
+  - OCR runs on the whole image (no tiling); slow on CPU for large images
+  - Only axis-independent polygons are erased; very dense text over walls will
+    leave inpainting artifacts
+  - Dimension classification is regex-based (digits, common units, feet-inch);
+    it does not parse values or associate them with dimension lines
+  - Inpainting assumes dark-on-light input; run Module 1 first
+
+3.4 Coordinates and scale
+  - All coordinates are in the pixel space of the image given to Module 2.
+    If Module 1 downscaled the source, divide by scale_factor to return to
+    original pixels
+  - No real-world scale is computed here (that needs dimension parsing)
+
+3.5 Not covered
+  - DXF/vector input (Module 1 handles it; perception rejects it with a clear error)
+  - Rooms, stairs, fixtures, multi-floor plans
+  - Multi-image batching, async execution, GPU memory management, timeouts
+  - Process isolation for untrusted files or models (same advice as Module 1)
+
+3.6 Validation status
+  - Tests use synthetic drawings only; no real floor plans were evaluated
+  - Thresholds (OCR confidence, min stroke length, door size ratio, arc fit
+    tolerances) are reasonable defaults, not tuned values - tune on your data
+  - Tested on Python 3.12 with OpenCV 5.0, NumPy and ezdxf versions current at
+    the time; EasyOCR and Ultralytics were not installed in the test environment
+
+
+4. RECOMMENDED NEXT STEPS
+-------------------------
+  1. Run examples/run_pipeline.py on 20-50 real plans and inspect overlay.png
+  2. Install EasyOCR and test text removal on real plans; tune ocr_min_confidence
+  3. Train or obtain YOLO weights for doors/windows and map class names
+  4. If walls are noisy, add a learned wall segmenter behind the same interface
+  5. Add dimension parsing to compute real-world scale for Module 3

@@ -1,0 +1,34 @@
+MODULE 5 (export3d + Three.js viewer), FIXES MADE, AND WHAT STILL LIMITS ACCURACY
+=================================================================================
+
+ADDED
+- src/export3d: ScaledPlan -> scene.json (metres, Three axes). Walls are split around openings so doors and
+  windows are real holes (solid runs + lintel + sill + glass). Wall ends extended by t/2 to close corners.
+- viewer/index.html: Three.js r160 viewer (OrbitControls, shadows, floors from room polygons, area labels,
+  drag-and-drop scene.json). Serve with:  cd viewer && python -m http.server  -> http://localhost:8000
+  NOTE: the viewer was written but NOT rendered in a browser during this session; test it.
+
+FLAW FOUND BY RUNNING THE PIPELINE, AND FIXED
+- Double-line (hollow) walls skeletonised into two centrelines: 9 rooms (6 slivers) instead of the correct
+  result, thickness read as 3 px instead of ~18. Fix: topology fuses parallel strokes (directional closing,
+  TopologyConfig.hollow_wall_close_ratio=0.01) before skeletonisation. Doing this in perception instead caused
+  false door detections, so it lives in topology.
+
+FLAWS FOUND, NOT FIXED (need data/models, cannot be solved by heuristics)
+1. Doors: heuristic_symbols defaults to False, so no doors/windows are detected out of the box and rooms leak
+   through door gaps. A trained detector is required (see below).
+2. Manhattan assumption: segments are snapped to 0/90 deg. Diagonal and curved walls are distorted.
+3. Fixed heights: ceiling 2.7 m, sills 0.9 m. No real Z data exists in a 2-D plan.
+4. Wall thickness is clamped to 0.10-0.35 m; thick masonry/core walls are under-reported.
+5. Only one page/frame processed; multi-storey needs one run per level plus manual stacking.
+6. Confidence values are heuristic, not calibrated.
+
+RECOMMENDED ML (in order of accuracy gain per effort)
+1. Wall + room segmentation: U-Net / HRNet-style network trained on CubiCasa5k (+ R2V, ZInD if licensed). Export
+   to ONNX and use the existing wall_model_path. Keep geometry classical (already the design).
+2. Door/window detection: fine-tune YOLOv8/11 (or RT-DETR) on CubiCasa5k + your own labels; use symbol_model_path.
+   Prefer oriented boxes/keypoints (hinge, swing end) so opening width is exact, not box width.
+3. OCR: replace EasyOCR with PaddleOCR (PP-OCRv4) for rotated dimension text; keep tiled mode.
+4. Room-type classification (kitchen/bedroom...): small CNN on the rasterised room crop + OCR labels.
+5. Evaluation first: label 10-20 of YOUR plans; track wall F1, opening recall, room count, scale error.
+   Every change above should be accepted or rejected by those numbers.

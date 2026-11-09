@@ -1,0 +1,34 @@
+MODULE 4 (scale) AND LEARNED-PERCEPTION UPGRADES: FEATURES AND LIMITATIONS
+==========================================================================
+
+FEATURES
+- Scale arbitration: manual anchor > text consensus (dimensions, room sizes, 1:N + DPI) > door prior.
+- Unit-aware dimension parser: mm/cm/m/ft-in/fractions, decimal commas, thousands separators, OCR digit fixes,
+  weighted unit alternatives for bare numbers, area strings rejected.
+- Dimension-to-wall association on collinear runs, centred and parallel, with centreline / interior / exterior
+  hypotheses and a single-convention coherence preference.
+- Cross-validation: door prior vs text, plan-extent plausibility, wall thickness and door width sanity bands.
+- Metric plan: walls (start/end, length, clamped thickness, height, exterior/interior), openings (offsets along the
+  wall, sill/head heights), rooms (CCW rings, holes CW, centreline and interior areas, m2 and ft2).
+- Output frame: Y up, origin at the min corner (configurable); PlanTransform maps pixels <-> metres for UI overlays.
+- Learned wall segmentation (ONNX, tiled, blended) fused with classical walls (GUIDED / LEARNED / CLASSICAL).
+- Tiled OCR for small text on large sheets.
+- Typed, frozen/validated config; custom exceptions; JSON-serialisable outputs.
+
+LIMITATIONS
+- Confidence and relative_uncertainty are heuristics, not calibrated probabilities. Validate on your own plans.
+- Dimension association assumes the text sits near, parallel to and centred on the span it measures. Dimension
+  chains with leader lines, text placed far from its span, and arrow-only dimensions (no wall) are not understood.
+- Spans between non-wall features (furniture, columns, stairs) have no matching graph edge and are ignored.
+- Mixed unit systems on one sheet, and bare numbers outside the plausible length window, can be misread; they lose
+  the consensus vote but can lower confidence.
+- 1:N notation needs the page DPI and an un-rescaled print; PDFs scaled to fit a page give wrong results. It is a
+  medium-confidence input and is cross-checked, never trusted alone above text consensus.
+- Door prior assumes ~0.85 m doors (configurable): expect +/-10-15 %. Detected door boxes include frames/swing.
+- Heights are parametric defaults; the plan carries no real Z data (ceiling height, sills, lintels).
+- Thickness: double-line walls under-measure and are clamped to the configured minimum.
+- Exterior/interior classification uses room adjacency; walls touching no closed room are "unknown".
+- Learned wall model: no weights are shipped; quality depends entirely on training data matching your drawings.
+  GUIDED fusion can only remove strokes, never add walls the classical stage missed.
+- Manual anchors are in the pixel space of the image given to perception (not the original pre-downscale image).
+- Only the first PDF page / TIFF frame is processed (ingestion limit), so multi-storey sheets need separate runs.

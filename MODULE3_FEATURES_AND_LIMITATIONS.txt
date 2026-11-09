@@ -1,0 +1,176 @@
+TOPOLOGY MODULE (MODULE 3) - FEATURES AND LIMITATIONS
+=====================================================
+
+Package: topology (beside "ingestion" and "perception" in src/)
+Input:   uint8 wall mask (255 = wall) in image pixels, plus optional opening
+         boxes (doors / windows / openings) - normally PerceptionResult
+Output:  PlanarGraph - vertices, edges (with thickness, support, openings),
+         rooms (centreline polygon, holes, area, inset interior), diagnostics
+Extra dependencies: scipy, shapely >= 2.0, scikit-image
+
+
+1. FEATURES
+-----------
+
+1.1 Pipeline
+  1.  Skeletonize the wall mask (scikit-image) and measure wall thickness
+  2.  Trace the skeleton into branches and simplify to straight segments
+  3.  Remove short free-ended spurs
+  4.  Estimate the plan's dominant orientation and work in that frame
+  5.  Collapse short corner "chamfer" pieces left by thick corners
+  6.  Snap directions to configured angles (0/90 by default; 45/135 optional)
+  7.  Cluster nearby endpoints into shared junctions
+  8.  Align parallel walls onto common lines; put corners/T-junctions on exact
+      shared coordinates
+  9.  Attach dangling wall ends to nearby walls, inserting explicit vertices
+ 10.  Bridge door/opening gaps so rooms can close
+ 11.  Node all crossings (Shapely), merge straight chains, extract room faces
+ 12.  Build the vertex/edge graph and attach openings to host edges
+
+1.2 Geometry
+  - Thickness is measured from the mask (distance transform) and all tolerances
+    are multiples of it, so behaviour adapts to resolution and drawing style
+  - Per-edge thickness and "support" (fraction of the edge lying on wall pixels)
+  - Slightly rotated scans are handled: segments are regularized in the plan's
+    own frame and returned in image coordinates; rotation_deg reports the tilt
+  - Exact shared coordinates at corners and T-junctions (no floating-point
+    near-misses), so room extraction does not depend on lucky noding
+  - Degree-2 collinear chains are merged into single edges
+  - Skeleton tracing replaces the original LSD-on-skeleton approach, which
+    duplicated every segment and depends on an OpenCV build that may not ship
+    the LSD detector
+
+1.3 Openings
+  - Module 2 carves openings out of the wall mask. This module re-bridges each
+    gap with a connecting edge, so rooms stay closed at doors
+  - Each opening is attached to the edge it overlaps most (a wall running
+    through the box beats a perpendicular wall merely touching it)
+  - Distance is measured to the box, not its centre, so door-swing boxes that
+    extend into the room still find their wall
+  - Opening width and t1/t2 come from the box's extent ALONG the wall
+  - Overlapping openings of the same type on one edge are merged
+  - Openings with no host wall are reported in unattached_openings and warnings
+
+1.4 Rooms
+  - Closed cycles via Shapely polygonize; rooms nested inside others appear as
+    holes of the outer room and as their own rooms
+  - Centreline polygon and area, plus an inset "interior" polygon/area
+    (centreline minus half a wall thickness)
+  - Tiny faces and narrow slivers are discarded (area ratio, width ratio,
+    optional absolute width floor)
+  - Deterministic ordering (reading order) and contiguous ids
+
+1.5 Diagnostics
+  - dangling_vertices (degree-1 vertices), unclosed-room warnings, "no rooms"
+    warning, unattached openings, empty-mask handling
+  - to_dict() returns a JSON-serialisable structure
+
+1.6 Engineering
+  - Validated, frozen TopologyConfig; typed exceptions (TopologyError,
+    InvalidMaskError); input mask never modified
+  - Geometry code is pure functions on segments, unit-tested separately
+  - build_from_perception(PerceptionResult) for Module 2 output; raw boxes or
+    symbol objects accepted by build_topology
+  - 36 topology tests (111 total across all modules); ruff and mypy --strict clean
+  - Performance: a 2048 x 1500 six-room plan with 8 doors builds in ~0.2 s
+
+
+2. BUGS FIXED FROM THE ORIGINAL CODE
+------------------------------------
+  - Rooms could never close at doors: openings were carved from the mask but
+    nothing reconnected the wall -> opening bridging
+  - Dangling ends: only endpoint-to-endpoint clustering existed, so a wall
+    stopping a few px short of another (T-junctions) left rooms open ->
+    endpoint-to-wall snapping with explicit split vertices
+  - Opening width was half the box diagonal, halved again -> extent along wall
+  - Opening-to-wall matching used the box centre: door-swing boxes (centre far
+    from the wall) matched nothing -> box-to-wall distance and overlap scoring
+  - Duplicate segments from LSD run on a 1-px skeleton -> skeleton tracing
+  - Pure-Python morphological skeleton loop -> scikit-image skeletonize
+  - Manhattan snap logic was tangled and clustering by centroid re-tilted
+    already-snapped segments -> direction snap + exact axis alignment
+  - Rotating each piece about its own midpoint tore tilted walls apart ->
+    plan-frame regularization (found by testing a 2.5 degree rotation)
+  - Skeleton corner "chamfers" left dangling ends -> collapsed (found by test)
+  - Fixed pixel constants (thickness 20, tolerances 12/15 px) -> measured and
+    ratio-based
+  - Rebuilt the Shapely LineString for every symbol x edge pair -> built once,
+    spatial index
+  - Room ids were gaps after filtering; holes were ignored; no diagnostics
+
+Changed API (update callers):
+  - TopologyEngine(config=TopologyConfig(...)) replaces loose constructor args
+  - build_topology(wall_mask, doors, windows, openings) - doors/windows may be
+    symbol objects or (x1, y1, x2, y2) boxes
+  - GraphEdge gains support; thickness is measured per edge
+  - OpeningInterval.opening_type is an OpeningType enum; center_px lies on the
+    wall axis
+  - RoomFace gains centroid, holes, interior_polygon, interior_area_px
+  - PlanarGraph gains thickness_px, rotation_deg, dangling_vertices,
+    unattached_openings, warnings
+
+
+3. LIMITATIONS
+--------------
+
+3.1 Wall style and shape
+  - Assumes SOLID wall strokes. Double-line (outline) walls produce two thin
+    lines; measured "thickness" is then the stroke width, so sliver faces
+    between the lines appear as rooms unless you set min_room_width_px. Better:
+    fill/close the mask in Module 2 first
+  - Walls are straight segments; curved walls are approximated by short
+    segments or dropped
+  - Thick diagonal walls are only regularized if you add 45/135 to
+    snap_angles_deg, and Module 2 must have kept them in the mask
+  - Only ONE dominant orientation (modulo 90 degrees) is assumed. Plans with
+    two differently rotated wings are regularized against the dominant one and
+    the other wing is left unsnapped
+  - Walls whose skeleton drifts more than the snap tolerance are not repaired
+
+3.2 Openings
+  - A door whose gap touches a wall junction (e.g. a doorway exactly where a
+    partition meets the outer wall) can leave a dangling end; this is surfaced
+    as a warning instead of being guessed
+  - Only one bridge per opening, between two roughly collinear wall ends.
+    Wide double doors split into two detections, or arches carved wider than
+    the box, may not bridge
+  - Openings that span a junction or two edges attach to the best single edge
+  - Sliding/pocket doors, stairs, and doors recessed into thick masonry are not
+    modelled
+  - Quality depends on box accuracy from Module 2: loose boxes give wrong
+    widths (width is the box extent along the wall)
+
+3.3 Rooms
+  - Room polygons run along wall centrelines; use interior_area_px for the
+    floor area (estimated by inset, not by tracing the true inner wall faces)
+  - Rooms are bounded cycles only: open-plan areas separated by no wall merge
+    into one room, and any leak in the wall network merges rooms
+  - No room labels or types. Text from Module 2 is not associated with rooms
+  - No real-world units: everything is in pixels (needs dimension parsing)
+
+3.4 Scale and robustness
+  - Skeleton tracing runs in Python; very large masks with very long wall
+    networks (tens of thousands of skeleton pixels) may take seconds
+  - Thickness is a global median plus a per-edge estimate; plans mixing thin
+    and thick walls (e.g. 100 mm partitions and 300 mm exterior) use one global
+    scale for tolerances
+  - Deterministic but heuristic: tolerances are reasonable defaults, not tuned
+
+3.5 Validation status
+  - Tests use synthetic masks (rectangles, L-shape, closets, tilted plan, six
+    rooms with doors). No real floor plans were evaluated, and the full
+    ingestion -> perception -> topology chain was exercised only with
+    synthetic plans and fake detectors
+  - Tested on Python 3.12 with shapely 2.2, scipy 1.18, scikit-image 0.26,
+    OpenCV 5.0
+
+
+4. RECOMMENDED NEXT STEPS
+-------------------------
+  1. Run examples/run_pipeline.py on real plans; inspect overlay.png and
+     graph.json; read graph.warnings for each
+  2. Where Module 2's mask is noisy, improve it before tuning Module 3
+  3. Tune endpoint_snap_ratio, spur_length_ratio and min_room_width_* on real data
+  4. Convert pixels to metres by parsing dimension text (Module 2 classifies
+     dimension annotations) and add the scale to PlanarGraph
+  5. Add room labelling by matching Module 2 text boxes to room polygons
